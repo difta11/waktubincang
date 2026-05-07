@@ -1,197 +1,115 @@
-/**
- * device-manager.js
- * Manages device identity, presence broadcasting, and online-user tracking.
- *
- * Data paths:
- *   session1/users/{deviceId}  →  { name, deviceId, lastSeen, connectedAt }
- *
- * Usage:
- *   import DeviceManager from './device-manager.js';
- *   DeviceManager.init();
- */
-
 import FirebaseService from './firebase-service.js';
-import { Storage, nameToColor, nameToInitials, showToast } from '../utils.js';
+import { Storage, generateId, nameToColor, safeKey, now } from './utils.js';
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-const PRESENCE_PATH   = 'session1/users';
-const HEARTBEAT_MS    = 15_000;  // write lastSeen every 15 s
-const USERNAME_KEY    = 'markpro_username';
-const DEVICE_ID_KEY   = 'markpro_deviceid';
-const DEFAULT_NAMES   = ['Cam A','Cam B','Director','Script','Sound','Vfx','Floor'];
+const DEVICE_ID_KEY = 'markpro_device_id';
+const DEVICE_NAME_KEY = 'markpro_device_name';
+const USERNAME_KEY = 'markpro_username';
+const HEARTBEAT_MS = 5000;
 
-// ─── State ────────────────────────────────────────────────────────────────────
-let _deviceId   = null;
-let _username   = null;
-let _onlineCount = 0;
-let _heartbeat  = null;
-let _presenceUnsub = null;
+let heartbeat = null;
+let activeSessionId = null;
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function _generateDeviceId() {
-  return 'dev_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-}
-
-function _randomName() {
-  return DEFAULT_NAMES[Math.floor(Math.random() * DEFAULT_NAMES.length)] +
-         '_' + Math.random().toString(36).slice(2, 5).toUpperCase();
-}
-
-// ─── Public API ───────────────────────────────────────────────────────────────
 const DeviceManager = {
-
-  // ── Getters ──────────────────────────────────────────────────────────────────
-
-  get deviceId()    { return _deviceId; },
-  get username()    { return _username; },
-  get onlineCount() { return _onlineCount; },
-
-  // ── Init ─────────────────────────────────────────────────────────────────────
+  deviceId: null,
+  deviceName: null,
+  operatorName: 'Anonymous',
 
   init() {
-    // Restore or generate persistent device id
-    _deviceId = Storage.get(DEVICE_ID_KEY) || _generateDeviceId();
-    Storage.set(DEVICE_ID_KEY, _deviceId);
+    this.deviceId = Storage.get(DEVICE_ID_KEY) || generateId('dev');
+    this.deviceName = Storage.get(DEVICE_NAME_KEY) || defaultDeviceName();
+    this.operatorName = localStorage.getItem(USERNAME_KEY) || bridge().username || 'Anonymous';
 
-    // Restore or generate username
-    _username = Storage.get(USERNAME_KEY);
-    if (!_username) {
-      _username = _randomName();
-      Storage.set(USERNAME_KEY, _username);
-    }
+    Storage.set(DEVICE_ID_KEY, this.deviceId);
+    Storage.set(DEVICE_NAME_KEY, this.deviceName);
 
-    // Sync to legacy global (used by inline index.html scripts)
-    window.username = _username;
-    window.deviceId = _deviceId;
-
-    this._updateIdentityUI();
-    this._startPresence();
-    this._listenOnlineCount();
-
-    // Re-export rename capability to window for inline onclick handlers
-    window.openRenameModal = () => DeviceManager.openRenameModal();
+    window.markproDeviceId = this.deviceId;
+    window.markproDeviceName = this.deviceName;
   },
 
-  // ── Presence ─────────────────────────────────────────────────────────────────
-
-  _presencePath() {
-    return `${PRESENCE_PATH}/${_deviceId}`;
+  refreshIdentity() {
+    this.operatorName = localStorage.getItem(USERNAME_KEY) || bridge().username || this.operatorName || 'Anonymous';
+    this.deviceName = Storage.get(DEVICE_NAME_KEY) || this.deviceName || defaultDeviceName();
   },
 
-  _presence() {
+  presenceRecord(status = 'online') {
+    this.refreshIdentity();
     return {
-      name:        _username,
-      deviceId:    _deviceId,
-      lastSeen:    Date.now(),
-      connectedAt: Date.now()
+      device_id: this.deviceId,
+      device_name: this.deviceName,
+      operator_name: this.operatorName,
+      name: this.operatorName,
+      color: bridge().myAvatarColor || nameToColor(this.operatorName),
+      status,
+      last_seen: FirebaseService.serverTimestamp(),
+      last_seen_local: now()
     };
   },
 
-  async _startPresence() {
-    // Write initial presence
-    await FirebaseService.set(this._presencePath(), this._presence());
-
-    // Auto-remove on disconnect
-    FirebaseService.onDisconnectRemove(this._presencePath());
-
-    // Heartbeat
-    clearInterval(_heartbeat);
-    _heartbeat = setInterval(async () => {
-      await FirebaseService.set(`${PRESENCE_PATH}/${_deviceId}/lastSeen`, Date.now());
-    }, HEARTBEAT_MS);
-  },
-
-  async broadcastPresence() {
-    await FirebaseService.set(this._presencePath(), this._presence());
-    FirebaseService.onDisconnectRemove(this._presencePath());
-  },
-
-  // ── Online count listener ─────────────────────────────────────────────────
-
-  _listenOnlineCount() {
-    if (_presenceUnsub) { _presenceUnsub(); _presenceUnsub = null; }
-    _presenceUnsub = FirebaseService.listen(PRESENCE_PATH, (data) => {
-      const users = data ? Object.values(data) : [];
-      _onlineCount = users.length;
-      const el = document.getElementById('online-count');
-      if (el) el.innerText = `${_onlineCount} online`;
+  async registerGlobalPresence() {
+    this.refreshIdentity();
+    const path = `${FirebaseService.paths.legacyUsers}/${safeKey(this.deviceId)}`;
+    await FirebaseService.set(path, {
+      name: this.operatorName,
+      deviceId: this.deviceId,
+      deviceName: this.deviceName,
+      status: 'online',
+      lastSeen: now()
     });
+    FirebaseService.onDisconnectRemove(path);
   },
 
-  // ── Username management ───────────────────────────────────────────────────
+  async joinSession(sessionId) {
+    if (!sessionId) return;
+    activeSessionId = sessionId;
+    await FirebaseService.set(FirebaseService.paths.device(sessionId, this.deviceId), this.presenceRecord('online'));
+    FirebaseService.onDisconnectUpdate(FirebaseService.paths.device(sessionId, this.deviceId), {
+      status: 'offline',
+      last_seen: FirebaseService.serverTimestamp(),
+      last_seen_local: now()
+    });
 
-  async setUsername(newName) {
-    const trimmed = newName.trim();
-    if (!trimmed || trimmed === _username) return;
-    _username = trimmed;
-    window.username = _username;
-    Storage.set(USERNAME_KEY, _username);
-    await this.broadcastPresence();
-    this._updateIdentityUI();
+    clearInterval(heartbeat);
+    heartbeat = setInterval(() => this.heartbeat(), HEARTBEAT_MS);
   },
 
-  // ── UI updates ────────────────────────────────────────────────────────────
-
-  _updateIdentityUI() {
-    const color    = nameToColor(_username);
-    const initials = nameToInitials(_username);
-
-    // Header display
-    const headerName = document.getElementById('username-display');
-    if (headerName) headerName.textContent = _username || '—';
-
-    // Identity bar (blocks screen)
-    const identName   = document.getElementById('identity-name');
-    const identAvatar = document.getElementById('identity-avatar');
-    if (identName)   identName.textContent   = _username || '—';
-    if (identAvatar) {
-      identAvatar.textContent    = initials;
-      identAvatar.style.background = color;
-    }
-  },
-
-  // ── Rename modal ──────────────────────────────────────────────────────────
-
-  openRenameModal() {
-    // Try to use existing modal in index.html
-    const modal = document.getElementById('modal-rename');
-    if (modal) {
-      const input = document.getElementById('rename-input');
-      if (input) input.value = _username;
-      modal.classList.add('open');
-      if (input) setTimeout(() => { input.focus(); input.select(); }, 50);
+  async heartbeat() {
+    this.refreshIdentity();
+    if (!activeSessionId) {
+      await this.registerGlobalPresence().catch(() => {});
       return;
     }
-    // Fallback: simple prompt
-    const name = prompt('Nama kamu:', _username);
-    if (name) this.setUsername(name);
+    await FirebaseService.update(FirebaseService.paths.device(activeSessionId, this.deviceId), {
+      operator_name: this.operatorName,
+      name: this.operatorName,
+      device_name: this.deviceName,
+      status: 'online',
+      last_seen: FirebaseService.serverTimestamp(),
+      last_seen_local: now()
+    }).catch(() => {});
   },
 
-  confirmRename() {
-    const input = document.getElementById('rename-input');
-    if (!input) return;
-    const name = input.value.trim();
-    if (name) {
-      this.setUsername(name);
-      showToast('✅ Nama diperbarui: ' + name);
+  async leaveSession(sessionId = activeSessionId) {
+    if (!sessionId) return;
+    await FirebaseService.update(FirebaseService.paths.device(sessionId, this.deviceId), {
+      status: 'offline',
+      last_seen: FirebaseService.serverTimestamp(),
+      last_seen_local: now()
+    }).catch(() => {});
+    if (sessionId === activeSessionId) {
+      activeSessionId = null;
+      clearInterval(heartbeat);
+      heartbeat = null;
     }
-    const modal = document.getElementById('modal-rename');
-    if (modal) modal.classList.remove('open');
-  },
-
-  // ── Cleanup ───────────────────────────────────────────────────────────────
-
-  destroy() {
-    clearInterval(_heartbeat);
-    if (_presenceUnsub) { _presenceUnsub(); _presenceUnsub = null; }
   }
 };
 
-export default DeviceManager;
+function bridge() {
+  return window.MarkProBridge || {};
+}
 
-// ── Wire inline index.html handlers ──────────────────────────────────────────
-// These globals are called by onclick="..." attributes in the existing HTML.
-// Declare here so they work even before app.js runs.
-window.updateIdentityUI   = () => DeviceManager._updateIdentityUI();
-window.broadcastPresence  = () => DeviceManager.broadcastPresence();
-window.confirmRename      = () => DeviceManager.confirmRename();
+function defaultDeviceName() {
+  const platform = navigator.userAgentData?.platform || navigator.platform || 'Browser';
+  return `${platform} Device`;
+}
+
+export default DeviceManager;

@@ -1,157 +1,157 @@
-# Waktu Berbincang — Realtime Timecode Sync
+# Waktu Berbincang Realtime Sync
 
-Multi-device, low-latency timecode synchronization system untuk produksi live, multicam, dan shooting.
+Vanilla JavaScript realtime timecode and marker sync for live production,
+multicam logging, cue tracking, and collaborative event notes.
 
----
+## Folder Structure
 
-## Struktur Proyek
-
-```
-project/
-├── index.html              ← UI utama (jangan diubah desainnya)
-│
+```text
+.
+├── index.html
+├── css/
+│   └── style.css
 ├── js/
-│   ├── app.js              ← Bootstrap entry point
-│   ├── firebase-service.js ← Low-level Firebase CRUD & listeners
-│   ├── device-manager.js   ← Identity, presence, online count
-│   ├── session-manager.js  ← Block CRUD, list, open/close
-│   ├── event-manager.js    ← Marking add/edit/delete & render
-│   ├── realtime-sync.js    ← Per-block realtime listeners
-│   └── utils.js            ← Toast, debounce, color helpers
-│
+│   ├── app.js
+│   ├── firebase-service.js
+│   ├── realtime-sync.js
+│   ├── session-manager.js
+│   ├── event-manager.js
+│   ├── device-manager.js
+│   └── utils.js
 ├── backend/
-│   ├── firebase-rules.json ← Security rules (deploy ke Firebase)
-│   └── firestore-schema.md ← Database schema & data flow docs
-│
+│   ├── firebase-rules.json
+│   └── firestore-schema.md
 └── README.md
 ```
 
----
+## Architecture
 
-## Cara Integrasi ke index.html
+The visual UI remains in `index.html`. The ES modules add a production realtime
+backend layer without redesigning the page.
 
-Cari blok script module di bagian bawah `index.html`:
+- `firebase-service.js`: Firebase initialization, CRUD helpers, realtime listener helpers, path helpers, server timestamps.
+- `device-manager.js`: persistent `device_id`, device name, operator name, session presence, heartbeat, reconnect status.
+- `session-manager.js`: treats existing blocks as live sessions and mirrors them to `/sessions/{sessionId}`.
+- `event-manager.js`: creates canonical event records, mirrors compatible markings, dedupes `client_event_id`, queues offline writes.
+- `realtime-sync.js`: active-session listeners for canonical events/devices/timecode/settings plus legacy compatibility.
+- `app.js`: boot sequence, keyboard shortcuts, reconnect recovery, and the legacy bridge.
 
-```html
-<script type="module">
-import { initializeApp } from "https://www.gstatic.com/firebasejs/...";
-...
-// semua kode inline Firebase
-</script>
+## Data Model
+
+Canonical production data:
+
+```text
+/sessions/{sessionId}
+/sessions/{sessionId}/events/{eventId}
+/sessions/{sessionId}/devices/{deviceId}
+/sessions/{sessionId}/state/timecode
+/sessions/{sessionId}/settings
 ```
 
-**Ganti seluruh blok tersebut** dengan satu baris:
+Legacy UI compatibility:
 
-```html
-<script type="module" src="js/app.js"></script>
+```text
+/session1/blocks/{blockId}
+/session1/blocks/{blockId}/markings/{markingId}
+/session1/timecodes/{blockId}
+/session1/settings/{blockId}
+/session1/users/{userKey}
 ```
 
-> ⚠️ Jangan hapus `<script>` non-module yang berisi timecode engine
-> (togglePlay, resetTC, frameToTC, loop, dll) — cukup ganti blok module.
+Every event contains:
 
----
+```json
+{
+  "event_id": "",
+  "session_id": "",
+  "timestamp_server": "",
+  "local_timestamp": "",
+  "device_id": "",
+  "device_name": "",
+  "operator_name": "",
+  "event_type": "",
+  "note": ""
+}
+```
 
-## Cara Deploy Firebase Rules
+Additional fields include `frame`, `timecode`, `color`, `client_event_id`, and
+`created_order`.
+
+## Run Locally
+
+Because the app uses ES modules, open it through an HTTP server.
 
 ```bash
-# Install Firebase CLI
+python -m http.server 3000
+```
+
+Then open:
+
+```text
+http://localhost:3000
+```
+
+## Firebase Rules
+
+Deploy `backend/firebase-rules.json` to Firebase Realtime Database.
+
+```bash
 npm install -g firebase-tools
-
-# Login
 firebase login
-
-# Init (pilih Realtime Database)
 firebase init database
-
-# Copy rules
-cp backend/firebase-rules.json database.rules.json
-
-# Deploy
 firebase deploy --only database
 ```
 
----
+## Realtime Data Flow
 
-## Cara Run Lokal
-
-Karena menggunakan ES modules, **harus dijalankan lewat HTTP server**, tidak bisa dibuka langsung sebagai file.
-
-```bash
-# Opsi 1: Python
-python3 -m http.server 3000
-
-# Opsi 2: Node
-npx serve .
-
-# Opsi 3: VS Code Live Server extension
-# Klik kanan index.html → Open with Live Server
-```
-
-Buka: `http://localhost:3000`
-
----
+1. User opens the page.
+2. Firebase initializes and legacy globals are exposed.
+3. Device gets a persistent `device_id`.
+4. User creates or opens a block.
+5. The block is mirrored as `/sessions/{sessionId}`.
+6. Device presence is written to `/sessions/{sessionId}/devices/{deviceId}`.
+7. Marker input writes a canonical event and a legacy marking.
+8. Other clients receive updates immediately through session-scoped listeners.
+9. Timecode writes happen only on play, pause, and reset; clients derive frames locally.
 
 ## Keyboard Shortcuts
 
-| Shortcut | Aksi |
-|----------|------|
-| `Space` / `P` | Play / Pause (HOST only) |
-| `M` | Tambah Point marking |
-| `R` | Toggle Range start/end |
-| `0` | Reset timecode (HOST only) |
-| `Escape` | Tutup modal |
+| Key | Action |
+| --- | --- |
+| `M` | Add point marker |
+| `R` | Start/end range marker |
+| `Space` or `P` | Host play/pause |
+| `0` | Host reset |
 
----
+## Low-Latency Strategy
 
-## Fitur
+- Firebase Realtime Database is used for direct low-latency socket updates.
+- Active listeners are scoped to the currently opened session.
+- Event feed uses child listeners instead of repeatedly downloading full trees.
+- Timecode is not written every frame; clients compute display frames locally.
+- Marker writes are fire-and-forget and UI feedback is immediate.
+- Presence heartbeat is small and periodic.
 
-- ✅ Realtime multi-device sync (Firebase Realtime Database)
-- ✅ Host/Guest role system
-- ✅ Point marking & range marking
-- ✅ Per-block FPS & format sync dari host ke guest
-- ✅ Online presence counter
-- ✅ Auto-cleanup presence on disconnect (onDisconnect)
-- ✅ Session restore setelah refresh
-- ✅ Toast notifikasi marker dari device lain
-- ✅ Connection status indicator (online/offline)
-- ✅ Keyboard shortcuts untuk operator kecepatan tinggi
-- ✅ Modular ES6 — mudah di-extend
+## Concurrency Strategy
 
----
+- Events use Firebase push IDs for collision-resistant keys.
+- `timestamp_server` is authoritative once resolved.
+- `created_order` provides immediate deterministic ordering before server time resolves.
+- `client_event_id` prevents duplicate replay during reconnect.
+- Legacy markings are mirrored for the existing UI, while `/sessions` remains the production event stream.
 
-## Arsitektur Sync Timecode
+## Offline Recovery
 
-```
-HOST device
-  Play pressed
-    └─ write session1/timecodes/{id} { running:true, startTime, frameOffset }
-    └─ jalankan requestAnimationFrame(loop) lokal (no-latency display)
+If an event write fails or the browser is offline, the event is stored in
+`localStorage` under `markpro_offline_event_queue`. On reconnect the app writes
+the same `event_id` again with a fresh server timestamp, making replay
+idempotent and preserving event order via `created_order`.
 
-GUEST devices (semua)
-  onValue(timecodes/{id}) fires
-    └─ hitung frame = (Date.now()-startTime)/1000 * fps + frameOffset
-    └─ jalankan requestAnimationFrame(loop) lokal (smooth display)
+## Verification Checklist
 
-Hasil: semua device sinkron dalam ~50-150ms
-Timecode display berjalan smooth (60fps) di semua device tanpa polling.
-```
-
----
-
-## Estimasi Latency
-
-| Aksi | Latency |
-|------|---------|
-| Play/Pause sync antar device | ~50–150 ms |
-| Marking tampil di device lain | ~50–200 ms |
-| Presence update | ~100–300 ms |
-
----
-
-## Best Practices
-
-1. **Satu HOST per block** — host adalah orang pertama yang membuka block, atau yang membuat block.
-2. **Gunakan WiFi yang sama** untuk latency paling rendah antar device.
-3. **Satu session per produksi** — buat block baru per scene/take, bukan per shift operator.
-4. **Jangan hapus block saat produksi berjalan** — marking akan hilang permanen.
-5. **Export CSV** sebelum hapus block (fitur export tersedia di UI).
+- Load the app through an HTTP server and confirm there are no module import errors.
+- Open two browser tabs and create a block in one; it should appear in the other.
+- Join the same block from both tabs and confirm participants update.
+- Add markers rapidly from both tabs; both feeds should converge.
+- Start, pause, and reset as host; guest devices should follow.
+- Toggle offline, add a marker, reconnect, and confirm it replays once.

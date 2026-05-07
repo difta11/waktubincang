@@ -1,238 +1,143 @@
-# Firebase Realtime Database — Schema & Data Flow
+# Firebase Realtime Database Schema
 
-> Project: **Waktu Berbincang** — Realtime Multi-Device Timecode Sync  
-> Database: Firebase Realtime Database (not Firestore)
+This project uses Firebase Realtime Database, not Firestore. The production
+schema is canonical under `/sessions`, while `session1/*` remains as a
+compatibility mirror for the existing `index.html` UI.
 
----
+## Canonical Paths
 
-## Root Structure
-
-```
-session1/
-├── users/          # Online presence per device
-│   └── {deviceId}
-│
-├── blocks/         # Timecode sessions
-│   └── {blockId}
-│       └── markings/
-│           └── {fbKey}
-│
-├── timecodes/      # Playback state per block
-│   └── {blockId}
-│
-└── settings/       # FPS + format per block
-    └── {blockId}
+```text
+sessions/
+  {sessionId}/
+    events/{eventId}
+    devices/{deviceId}
+    state/timecode
+    settings
 ```
 
----
-
-## Node Schemas
-
-### `session1/users/{deviceId}`
-
-Presence record for each connected device. Removed automatically on disconnect via `onDisconnect().remove()`.
+### `/sessions/{sessionId}`
 
 ```json
 {
-  "name":        "Cam A_XY3",
-  "deviceId":    "dev_lz4f7_abc",
-  "lastSeen":    1714000000000,
-  "connectedAt": 1714000000000
+  "session_id": "blk_123",
+  "legacy_block_id": "blk_123",
+  "name": "Scene 01",
+  "description": "Opening cue",
+  "host": "Operator A",
+  "created_by": "Operator A",
+  "date_label": "07 Mei 2026",
+  "live_user": null,
+  "status": "ready"
 }
 ```
 
-| Field | Type | Notes |
-|-------|------|-------|
-| `name` | string | Display name (max 50 chars) |
-| `deviceId` | string | Persistent UUID stored in localStorage |
-| `lastSeen` | number | Unix ms — updated via heartbeat every 15 s |
-| `connectedAt` | number | Unix ms — set on connect |
+### `/sessions/{sessionId}/events/{eventId}`
 
----
-
-### `session1/blocks/{blockId}`
-
-A timecode session (block). Contains nested markings.
+Every marker, cue, range, or production note is stored as an append-oriented
+event.
 
 ```json
 {
-  "id":        "blk_lz4abc",
-  "name":      "Scene 3 Take 2",
-  "fps":       25,
-  "created":   1714000000000,
-  "createdBy": "Director_ABC",
-  "liveUser":  "Director_ABC",
-  "markings": {
-    "-NxAbc123": {
-      "id":         1714000000123.456,
-      "type":       "point",
-      "startTC":    "00:01:23:15",
-      "startFrame": 2065,
-      "endTC":      "00:01:23:15",
-      "endFrame":   2065,
-      "color":      "#4f8ef7",
-      "notes":      "Good take",
-      "user":       "Director_ABC",
-      "ts":         1714000000123
-    }
-  }
+  "event_id": "-NxPushKey",
+  "session_id": "blk_123",
+  "timestamp_server": 1712345680,
+  "local_timestamp": 1712345678,
+  "device_id": "dev_abc",
+  "device_name": "Windows Device",
+  "operator_name": "Operator A",
+  "event_type": "MARKER",
+  "note": "Scene transition",
+  "frame": 1250,
+  "end_frame": 1250,
+  "timecode": "00:00:50:00",
+  "color": "#4f8ef7",
+  "client_event_id": "client_evt_xyz",
+  "created_order": 1712345678
 }
 ```
 
-| Field | Type | Notes |
-|-------|------|-------|
-| `id` | string | Block id (matches key) |
-| `name` | string | Human-readable name |
-| `fps` | number | Frames per second |
-| `created` | number | Creation timestamp (Unix ms) |
-| `createdBy` | string | Username of creator |
-| `liveUser` | string \| null | Username currently running timecode |
-| `markings` | object | Push-list of marking objects (see below) |
+Important indexes:
 
-#### `markings/{fbKey}`
+- `timestamp_server`: authoritative ordering after Firebase resolves the server timestamp.
+- `created_order`: immediate client-side ordering for low-latency feeds.
+- `client_event_id`: duplicate replay prevention.
+- `device_id`: device/operator filtering and diagnostics.
 
-| Field | Type | Notes |
-|-------|------|-------|
-| `id` | number | `Date.now() + Math.random()` — collision-safe |
-| `type` | `"point"` \| `"range"` | Marking type |
-| `startTC` | string | Timecode string at mark start |
-| `startFrame` | number | Frame number at mark start |
-| `endTC` | string | Same as startTC for points |
-| `endFrame` | number | Same as startFrame for points |
-| `color` | string | Hex color |
-| `notes` | string | Operator annotation (max 500 chars) |
-| `user` | string | Username who created the marking |
-| `ts` | number | Creation timestamp (Unix ms) |
+### `/sessions/{sessionId}/devices/{deviceId}`
 
----
-
-### `session1/timecodes/{blockId}`
-
-Playback state broadcast by the HOST device. All GUEST devices derive their local frame from this.
-
-**When playing (`running: true`):**
 ```json
 {
-  "running":     true,
-  "startTime":   1714000000000,
+  "device_id": "dev_abc",
+  "device_name": "Windows Device",
+  "operator_name": "Operator A",
+  "status": "online",
+  "last_seen": 1712345680,
+  "last_seen_local": 1712345678
+}
+```
+
+Devices update heartbeat every five seconds. `onDisconnect().update()` marks
+the device offline if the browser disconnects unexpectedly.
+
+### `/sessions/{sessionId}/state/timecode`
+
+```json
+{
+  "running": true,
+  "startTime": 1712345678,
   "frameOffset": 0,
-  "host":        "Director_ABC",
-  "ts":          1714000000000
+  "host": "Operator A",
+  "device_id": "dev_abc",
+  "timestamp_server": 1712345680
 }
 ```
 
-**When stopped (`running: false`):**
-```json
-{
-  "running":     false,
-  "frameAtStop": 1523,
-  "host":        "Director_ABC",
-  "ts":          1714000025000
-}
+Guests calculate current frame locally:
+
+```text
+frame = floor((Date.now() - startTime) / 1000 * fps) + frameOffset
 ```
 
-**When reset:**
-```json
-{
-  "running":     false,
-  "frameAtStop": 0,
-  "reset":       true,
-  "host":        "Director_ABC",
-  "ts":          1714000030000
-}
-```
+The host writes only on play, pause, and reset. Clients never write every frame.
 
-Guest frame calculation:
-```
-elapsed  = (Date.now() - startTime) / 1000   // seconds
-frame    = Math.floor(elapsed * fps) + frameOffset
-```
-
----
-
-### `session1/settings/{blockId}`
-
-FPS and timecode format — written by HOST, read by all GUESTs.
+### `/sessions/{sessionId}/settings`
 
 ```json
 {
   "fps": 25,
   "fmt": "hh:mm:ss:ff",
-  "ts":  1714000000000
+  "timestamp_server": 1712345680
 }
 ```
 
-Valid `fmt` values: `"hh:mm:ss:ff"`, `"mm:ss:ff"`, `"mm:ss"`, `"ss:ff"`, or any custom pattern string.
+## Legacy Compatibility Paths
 
----
-
-## Data Flow
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                        DEVICE (HOST)                         │
-│                                                              │
-│  User presses Play                                           │
-│       │                                                      │
-│       ▼                                                      │
-│  togglePlay() → syncStartTimecode()                          │
-│       │         └─ fb_set(timecodes/{id}, { running:true,   │
-│       │                   startTime: Date.now(), ... })      │
-│       │                                                      │
-│  requestAnimationFrame(loop) ← runs locally for low-latency  │
-└──────────────────────┬───────────────────────────────────────┘
-                       │ Firebase Realtime Database
-                       │ (≈ 50–150 ms propagation)
-                       ▼
-┌──────────────────────────────────────────────────────────────┐
-│                   ALL GUEST DEVICES                          │
-│                                                              │
-│  attachTimecodeListener(blockId)                             │
-│       │                                                      │
-│       ▼                                                      │
-│  onValue() fires → _applyTCToGuest(data, fps)               │
-│       │                                                      │
-│       ▼                                                      │
-│  frame = Math.floor((Date.now()-startTime)/1000 * fps)      │
-│  + frameOffset                                               │
-│       │                                                      │
-│       ▼                                                      │
-│  start local requestAnimationFrame(loop) for smooth display  │
-└──────────────────────────────────────────────────────────────┘
+```text
+session1/
+  blocks/{blockId}
+  blocks/{blockId}/markings/{markingId}
+  timecodes/{blockId}
+  settings/{blockId}
+  users/{userKey}
 ```
 
----
+The current UI still renders block cards and marking cards from
+`session1/blocks`. New writes are mirrored to `/sessions` so production event
+streams and presence are available without redesigning the app.
 
-## Listener Lifecycle
+## Realtime Flow
 
-| Listener | Attached when | Detached when |
-|----------|--------------|---------------|
-| `attachBlocksListener` | `SessionManager.init()` | App unmount |
-| `attachTimecodeListener` | `openBlock(id)` | `backToBlocks()` |
-| `attachSettingsListener` | `openBlock(id)` | `backToBlocks()` |
-| `attachMarkersListener` | `openBlock(id)` | `backToBlocks()` |
-| Presence (users) | `DeviceManager.init()` | App unmount |
+1. App boots Firebase and exposes legacy globals used by the inline UI.
+2. Existing block listener reads `session1/blocks`.
+3. Opening a block registers the device under `/sessions/{sessionId}/devices`.
+4. Marker clicks write:
+   - canonical event to `/sessions/{sessionId}/events/{eventId}`
+   - compatible marking to `session1/blocks/{blockId}/markings/{pushId}`
+5. Timecode state writes to both canonical and legacy paths.
+6. Active-session listeners are detached on leave to avoid cross-session leaks.
 
----
+## Offline Recovery
 
-## Performance Notes
-
-- **Listener scope**: Per-block listeners are narrow — only subscribe to data for the active block, not all blocks globally.
-- **No debounce on marking writes**: Marking writes are fire-and-forget via `push()` — no debounce needed.
-- **Timecode writes**: Only the HOST writes to `timecodes/` on Play/Pause/Reset (3 events), not on every frame. Guests reconstruct the frame locally via `requestAnimationFrame`.
-- **Heartbeat**: Presence heartbeat is 15 s — low overhead.
-- **`onDisconnect`**: Auto-removes presence record on disconnect — no stale users.
-
----
-
-## Bandwidth Estimate (per session, all devices)
-
-| Event | Size | Frequency |
-|-------|------|-----------|
-| Play / Pause | ~100 B | On demand |
-| Marking added | ~250 B | On demand |
-| Settings change | ~60 B | Rarely |
-| Heartbeat (per device) | ~20 B | Every 15 s |
-| Block list sync | ~500 B | On block create/delete |
-
-Total typical bandwidth: **< 1 KB/min per device** during idle; spikes on marking bursts.
+Failed event writes are stored in `localStorage` under
+`markpro_offline_event_queue`. Each event includes `client_event_id`; replay on
+reconnect writes the same `event_id`, which makes retries idempotent.

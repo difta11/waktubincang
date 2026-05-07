@@ -1,87 +1,105 @@
 {
   "rules": {
+    ".read": true,
+    ".write": true,
+
+    "sessions": {
+      "$sessionId": {
+        ".read": true,
+        ".write": true,
+        "events": {
+          ".indexOn": ["timestamp_server", "created_order", "client_event_id", "device_id"],
+          "$eventId": {
+            ".validate": "!newData.exists() || newData.hasChildren(['event_id','session_id','timestamp_server','local_timestamp','device_id','device_name','operator_name','event_type','note'])",
+            "event_id": { ".validate": "newData.isString() && newData.val() === $eventId" },
+            "session_id": { ".validate": "newData.isString() && newData.val() === $sessionId" },
+            "timestamp_server": { ".validate": "newData.isNumber()" },
+            "local_timestamp": { ".validate": "newData.isNumber()" },
+            "device_id": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 128" },
+            "device_name": { ".validate": "newData.isString() && newData.val().length <= 120" },
+            "operator_name": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 80" },
+            "event_type": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 40" },
+            "note": { ".validate": "newData.isString() && newData.val().length <= 1000" },
+            "frame": { ".validate": "newData.isNumber()" },
+            "end_frame": { ".validate": "newData.isNumber()" },
+            "timecode": { ".validate": "newData.isString() && newData.val().length <= 80" },
+            "color": { ".validate": "newData.isString() && newData.val().length <= 32" },
+            "client_event_id": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 160" },
+            "created_order": { ".validate": "newData.isNumber()" },
+            "$other": { ".validate": true }
+          }
+        },
+        "devices": {
+          ".indexOn": ["status", "last_seen", "device_id"],
+          "$deviceId": {
+            ".validate": "!newData.exists() || newData.hasChildren(['device_id','device_name','operator_name','status','last_seen'])",
+            "device_id": { ".validate": "newData.isString() && newData.val() === $deviceId" },
+            "device_name": { ".validate": "newData.isString() && newData.val().length <= 120" },
+            "operator_name": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 80" },
+            "status": { ".validate": "newData.val() === 'online' || newData.val() === 'offline'" },
+            "last_seen": { ".validate": "newData.isNumber()" },
+            "last_seen_local": { ".validate": "newData.isNumber()" },
+            "$other": { ".validate": true }
+          }
+        },
+        "state": {
+          "timecode": {
+            ".validate": "!newData.exists() || newData.hasChildren(['running'])",
+            "running": { ".validate": "newData.isBoolean()" },
+            "startTime": { ".validate": "newData.isNumber()" },
+            "frameOffset": { ".validate": "newData.isNumber()" },
+            "frameAtStop": { ".validate": "newData.isNumber()" },
+            "reset": { ".validate": "newData.isBoolean()" },
+            "$other": { ".validate": true }
+          }
+        },
+        "settings": {
+          ".validate": "!newData.exists() || newData.hasChildren(['fps','fmt'])",
+          "fps": { ".validate": "newData.isNumber() && newData.val() >= 1 && newData.val() <= 240" },
+          "fmt": { ".validate": "newData.isString() && newData.val().length <= 80" },
+          "$other": { ".validate": true }
+        },
+        "$other": { ".validate": true }
+      }
+    },
+
     "session1": {
-
-      // ── Online users / presence ──────────────────────────────────────────
       "users": {
-        "$deviceId": {
-          ".read":  true,
+        ".indexOn": ["lastSeen", "deviceId"],
+        "$userKey": {
+          ".read": true,
           ".write": true,
-          ".validate": "newData.hasChildren(['name','deviceId','lastSeen'])",
-
-          "name":        { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 50" },
-          "deviceId":    { ".validate": "newData.isString()" },
-          "lastSeen":    { ".validate": "newData.isNumber()" },
-          "connectedAt": { ".validate": "newData.isNumber()" }
+          "$other": { ".validate": true }
         }
       },
-
-      // ── Blocks (sessions) ────────────────────────────────────────────────
       "blocks": {
-        ".read":  true,
-
+        ".read": true,
         "$blockId": {
           ".write": true,
-          ".validate": "newData.hasChildren(['id','name','fps','created','createdBy'])",
-
-          "id":        { ".validate": "newData.isString()" },
-          "name":      { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 100" },
-          "fps":       { ".validate": "newData.isNumber() && newData.val() >= 1 && newData.val() <= 240" },
-          "created":   { ".validate": "newData.isNumber()" },
-          "createdBy": { ".validate": "newData.isString()" },
-          "liveUser":  { ".validate": "newData.isString() || newData.val() === null" },
-
-          // ── Markings ─────────────────────────────────────────────────────
           "markings": {
+            ".indexOn": ["ts", "client_event_id", "event_id"],
             "$markingId": {
               ".write": true,
-              ".validate": "!newData.exists() || newData.hasChildren(['id','type','startTC','startFrame','user','ts'])",
-
-              "id":         { ".validate": "newData.isNumber()" },
-              "type":       { ".validate": "newData.val() === 'point' || newData.val() === 'range'" },
-              "startTC":    { ".validate": "newData.isString()" },
-              "startFrame": { ".validate": "newData.isNumber()" },
-              "endTC":      { ".validate": "newData.isString()" },
-              "endFrame":   { ".validate": "newData.isNumber()" },
-              "color":      { ".validate": "newData.isString()" },
-              "notes":      { ".validate": "newData.isString() && newData.val().length <= 500" },
-              "user":       { ".validate": "newData.isString()" },
-              "ts":         { ".validate": "newData.isNumber()" }
+              "$other": { ".validate": true }
             }
-          }
+          },
+          "$other": { ".validate": true }
         }
       },
-
-      // ── Timecode state ───────────────────────────────────────────────────
       "timecodes": {
         "$blockId": {
-          ".read":  true,
+          ".read": true,
           ".write": true,
-          ".validate": "newData.hasChildren(['running'])",
-
-          "running":     { ".validate": "newData.isBoolean()" },
-          "startTime":   { ".validate": "newData.isNumber()" },
-          "frameOffset": { ".validate": "newData.isNumber()" },
-          "frameAtStop": { ".validate": "newData.isNumber()" },
-          "host":        { ".validate": "newData.isString()" },
-          "reset":       { ".validate": "newData.isBoolean()" },
-          "ts":          { ".validate": "newData.isNumber()" }
+          "$other": { ".validate": true }
         }
       },
-
-      // ── FPS / format settings ────────────────────────────────────────────
       "settings": {
         "$blockId": {
-          ".read":  true,
+          ".read": true,
           ".write": true,
-          ".validate": "newData.hasChildren(['fps','fmt'])",
-
-          "fps": { ".validate": "newData.isNumber() && newData.val() >= 1 && newData.val() <= 240" },
-          "fmt": { ".validate": "newData.isString()" },
-          "ts":  { ".validate": "newData.isNumber()" }
+          "$other": { ".validate": true }
         }
       }
-
     }
   }
 }

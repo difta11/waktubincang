@@ -1,305 +1,148 @@
-/**
- * event-manager.js
- * Handles all marking/event recording, display, edit, and delete.
- *
- * Firebase path:
- *   session1/blocks/{blockId}/markings/{fbKey}  →  marking object
- *
- * Each marking:
- * {
- *   id, type, startTC, startFrame, endTC, endFrame,
- *   color, notes, user, ts, _fbKey (local only)
- * }
- */
-
 import FirebaseService from './firebase-service.js';
-import DeviceManager   from './device-manager.js';
-import SessionManager  from '../session-manager.js';
-import { showToast, flashElement } from '../utils.js';
+import DeviceManager from './device-manager.js';
+import { Storage, generateId, now } from './utils.js';
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-const MARKS_PATH = (blockId) => `session1/blocks/${blockId}/markings`;
+const QUEUE_KEY = 'markpro_offline_event_queue';
+const DEDUPE_KEY = 'markpro_recent_client_events';
+const MAX_DEDUPE = 500;
 
-// ─── State ────────────────────────────────────────────────────────────────────
-let _editingId = null;   // id of marking being edited in modal
+let replaying = false;
 
-// ─── Public API ───────────────────────────────────────────────────────────────
 const EventManager = {
-
-  // ── Init ─────────────────────────────────────────────────────────────────────
-
   init() {
-    // Wire global functions used by inline onclick handlers
-    window.addPoint          = () => EventManager.addPoint();
-    window.toggleRange       = () => EventManager.toggleRange();
-    window.deleteMarking     = (id) => EventManager.deleteMarking(id);
-    window.openEditModal     = (id) => EventManager.openEditModal(id);
-    window.confirmEditMarking = () => EventManager.confirmEditMarking();
-    window.renderList        = () => EventManager.renderList();
-    window.renderStats       = () => EventManager.renderStats();
-    window.flashDisplay      = () => EventManager.flashDisplay();
+    window.addEventListener('online', () => this.flushQueue());
   },
 
-  // ── Add Point ─────────────────────────────────────────────────────────────────
+  async recordMarker(mark) {
+    const sessionId = bridge().currentBlockId;
+    if (!sessionId || !mark) return null;
 
-  addPoint() {
-    const blockId = SessionManager.currentBlockId;
-    if (!blockId) return;
+    const eventId = FirebaseService.newKey(FirebaseService.paths.events(sessionId));
+    const clientEventId = mark.client_event_id || generateId('client_evt');
+    mark.client_event_id = clientEventId;
+    mark.event_id = eventId;
 
-    const tc   = window.frameToTC ? window.frameToTC(window.frame) : '00:00:00:00';
-    const mark = {
-      id:         Date.now() + Math.random(),
-      type:       'point',
-      startTC:    tc,
-      startFrame: window.frame || 0,
-      endTC:      tc,
-      endFrame:   window.frame || 0,
-      color:      this._getSelectedColor(),
-      notes:      this._getNotes() || ('mark' + ((SessionManager.getCurrentBlock()?.markings?.length ?? 0) + 1)),
-      user:       DeviceManager.username,
-      ts:         Date.now()
-    };
+    const event = this.markerToEvent(sessionId, eventId, clientEventId, mark);
+    if (this.isDuplicate(clientEventId)) return eventId;
 
-    this._syncMarker(blockId, mark);
-    this.flashDisplay();
+    this.remember(clientEventId);
 
-    if (window.innerWidth < 700 && typeof window.switchTab === 'function') {
-      window.switchTab('markings');
+    if (!navigator.onLine) {
+      this.queue(event);
+      return eventId;
     }
-  },
 
-  // ── Range (Start / End) ───────────────────────────────────────────────────────
-
-  toggleRange() {
-    if (window.rangeStart === null || window.rangeStart === undefined) {
-      // Start range
-      window.rangeStart      = window.frameToTC ? window.frameToTC(window.frame) : '00:00:00:00';
-      window.rangeStartFrame = window.frame || 0;
-
-      const ri   = document.getElementById('range-indicator');
-      if (ri) ri.classList.add('active');
-      const rtog = document.getElementById('btn-range-toggle');
-      if (rtog) { rtog.textContent = '■ End Range'; rtog.classList.add('warning'); }
-      const mri  = document.getElementById('m-range-icon');
-      if (mri) mri.textContent = '■';
-      const mrl  = document.getElementById('m-range-label');
-      if (mrl) mrl.textContent = 'End Range';
-      const mrb  = document.getElementById('m-btn-range');
-      if (mrb) mrb.classList.add('recording');
-
-      const rsd = document.getElementById('range-start-display');
-      if (rsd) rsd.textContent = 'From ' + window.rangeStart;
-
-    } else {
-      // End range
-      const blockId = SessionManager.currentBlockId;
-      if (!blockId) return;
-
-      const endTC    = window.frameToTC ? window.frameToTC(window.frame) : '00:00:00:00';
-      const endFrame = window.frame || 0;
-      const block    = SessionManager.getCurrentBlock();
-
-      const mark = {
-        id:         Date.now() + Math.random(),
-        type:       'range',
-        startTC:    window.rangeStart,
-        startFrame: window.rangeStartFrame,
-        endTC,
-        endFrame,
-        color:      this._getSelectedColor(),
-        notes:      this._getNotes() || ('range' + ((block?.markings?.length ?? 0) + 1)),
-        user:       DeviceManager.username,
-        ts:         Date.now()
-      };
-
-      this._syncMarker(blockId, mark);
-      this.flashDisplay();
-
-      // Reset range state
-      window.rangeStart      = null;
-      window.rangeStartFrame = null;
-
-      const ri   = document.getElementById('range-indicator');
-      if (ri) ri.classList.remove('active');
-      const rtog = document.getElementById('btn-range-toggle');
-      if (rtog) { rtog.textContent = '▷ Start Range'; rtog.classList.remove('warning'); }
-      const mri  = document.getElementById('m-range-icon');
-      if (mri) mri.textContent = '▷';
-      const mrl  = document.getElementById('m-range-label');
-      if (mrl) mrl.textContent = 'Start Range';
-      const mrb  = document.getElementById('m-btn-range');
-      if (mrb) mrb.classList.remove('recording');
-
-      if (window.innerWidth < 700 && typeof window.switchTab === 'function') {
-        window.switchTab('markings');
-      }
-    }
-  },
-
-  // ── Firebase sync ─────────────────────────────────────────────────────────────
-
-  async _syncMarker(blockId, mark) {
     try {
-      const key = await FirebaseService.push(MARKS_PATH(blockId), mark);
-      mark._fbKey = key;
-    } catch(e) {
-      console.warn('[EventManager] syncMarker error', e);
+      await FirebaseService.set(FirebaseService.paths.event(sessionId, eventId), event);
+      return eventId;
+    } catch (error) {
+      this.queue(event);
+      console.warn('[EventManager] queued event after write failure', error);
+      return eventId;
     }
   },
 
-  async deleteMarking(id) {
-    const blockId = SessionManager.currentBlockId;
-    if (!blockId) return;
-    const block = SessionManager.getCurrentBlock();
-    if (!block) return;
-
-    const mark = block.markings.find(m => String(m.id) === String(id));
-    if (!mark?._fbKey) return;
-
-    await FirebaseService.remove(`${MARKS_PATH(blockId)}/${mark._fbKey}`);
+  markerToEvent(sessionId, eventId, clientEventId, mark) {
+    DeviceManager.refreshIdentity();
+    const timecode = mark.type === 'range' ? `${mark.startTC} -> ${mark.endTC}` : mark.startTC;
+    return {
+      event_id: eventId,
+      session_id: sessionId,
+      timestamp_server: FirebaseService.serverTimestamp(),
+      local_timestamp: now(),
+      device_id: DeviceManager.deviceId,
+      device_name: DeviceManager.deviceName,
+      operator_name: DeviceManager.operatorName || bridge().username || 'Anonymous',
+      event_type: mark.type === 'range' ? 'RANGE' : 'MARKER',
+      note: mark.notes || '',
+      frame: mark.startFrame || bridge().frame || 0,
+      end_frame: mark.endFrame ?? mark.startFrame ?? bridge().frame ?? 0,
+      timecode,
+      startTC: mark.startTC || timecode,
+      endTC: mark.endTC || mark.startTC || timecode,
+      color: mark.color || bridge().color || '#4f8ef7',
+      client_event_id: clientEventId,
+      created_order: now(),
+      legacy_mark_id: String(mark.id),
+      type: mark.type || 'point',
+      user: mark.user || bridge().username || 'Anonymous'
+    };
   },
 
-  async _syncEditMarker(mark) {
-    const blockId = SessionManager.currentBlockId;
-    if (!blockId || !mark._fbKey) return;
-    await FirebaseService.set(`${MARKS_PATH(blockId)}/${mark._fbKey}`, mark);
+  async updateEvent(mark) {
+    const sessionId = bridge().currentBlockId;
+    if (!sessionId || !mark) return;
+    const eventId = mark.event_id || mark._eventKey;
+    if (!eventId) return;
+    await FirebaseService.update(FirebaseService.paths.event(sessionId, eventId), {
+      note: mark.notes || '',
+      color: mark.color || '#4f8ef7',
+      startTC: mark.startTC || '',
+      endTC: mark.endTC || '',
+      timecode: mark.type === 'range' ? `${mark.startTC} -> ${mark.endTC}` : mark.startTC,
+      updated_local: now()
+    }).catch(() => {});
   },
 
-  // ── Edit modal ────────────────────────────────────────────────────────────────
-
-  openEditModal(id) {
-    const block = SessionManager.getCurrentBlock();
-    if (!block) return;
-    const mark = block.markings.find(m => String(m.id) === String(id));
-    if (!mark) return;
-
-    _editingId = id;
-
-    const modal = document.getElementById('modal-edit');
-    if (!modal) return;
-
-    const notesEl = document.getElementById('edit-notes');
-    if (notesEl) notesEl.value = mark.notes || '';
-
-    // Color picker
-    const colorPicker = modal.querySelector('#edit-color-picker');
-    if (colorPicker) {
-      colorPicker.querySelectorAll('[data-color]').forEach(btn => {
-        btn.classList.toggle('selected', btn.dataset.color === mark.color);
-      });
+  async deleteEvent(markId) {
+    const sessionId = bridge().currentBlockId;
+    const block = bridge().block;
+    if (!sessionId || !block) return;
+    const mark = (block.markings || []).find((item) => String(item.id) === String(markId));
+    const eventId = mark?.event_id || mark?._eventKey;
+    if (eventId) {
+      await FirebaseService.update(FirebaseService.paths.event(sessionId, eventId), {
+        deleted: true,
+        deleted_local: now()
+      }).catch(() => {});
     }
-
-    modal.classList.add('open');
-    setTimeout(() => notesEl?.focus(), 50);
   },
 
-  async confirmEditMarking() {
-    if (_editingId === null) return;
-
-    const block = SessionManager.getCurrentBlock();
-    if (!block) return;
-    const mark = block.markings.find(m => String(m.id) === String(_editingId));
-    if (!mark) return;
-
-    const notesEl = document.getElementById('edit-notes');
-    if (notesEl) mark.notes = notesEl.value.trim();
-
-    const modal = document.getElementById('modal-edit');
-    const colorSel = modal?.querySelector('#edit-color-picker .selected');
-    if (colorSel) mark.color = colorSel.dataset.color;
-
-    await this._syncEditMarker(mark);
-
-    if (modal) modal.classList.remove('open');
-    _editingId = null;
-    showToast('✅ Marking diperbarui');
-  },
-
-  // ── Render marking list ───────────────────────────────────────────────────────
-
-  renderList() {
-    const listEl = document.getElementById('list');
-    if (!listEl) return;
-
-    const block = SessionManager.getCurrentBlock();
-    const markings = block?.markings ?? [];
-
-    if (!markings.length) {
-      listEl.innerHTML = `
-        <div class="empty-state" style="padding:32px 0">
-          <div class="icon">📌</div>
-          <p>Belum ada marking.<br>Tekan <b>Point</b> atau <b>Range</b> untuk mulai.</p>
-        </div>`;
-      return;
+  queue(event) {
+    const queue = Storage.get(QUEUE_KEY, []);
+    if (!queue.some((item) => item.client_event_id === event.client_event_id)) {
+      queue.push(event);
+      Storage.set(QUEUE_KEY, queue);
     }
-
-    // Sort by startFrame ascending
-    const sorted = [...markings].sort((a, b) => (a.startFrame || 0) - (b.startFrame || 0));
-
-    listEl.innerHTML = sorted.map((m, i) => this._markingRowHTML(m, i)).join('');
   },
 
-  _markingRowHTML(m, idx) {
-    const tcLabel = m.type === 'range'
-      ? `${m.startTC} → ${m.endTC}`
-      : m.startTC;
-    const durationFrames = (m.endFrame || 0) - (m.startFrame || 0);
-    const durationLabel  = m.type === 'range' ? ` (${durationFrames}f)` : '';
-
-    return `
-      <div class="list-item" data-mark-id="${m.id}">
-        <div class="list-item-color" style="background:${m.color||'var(--accent)'}"></div>
-        <div class="list-item-body">
-          <div class="list-item-tc">${tcLabel}${durationLabel}</div>
-          <div class="list-item-notes">${this._esc(m.notes || '')}
-            <span class="list-item-user" style="color:var(--text3);font-size:10px"> · ${this._esc(m.user || '')}</span>
-          </div>
-        </div>
-        <div class="list-item-actions">
-          <button class="btn icon sm" title="Edit" onclick="openEditModal(${m.id})">✏️</button>
-          <button class="btn icon sm danger" title="Hapus" onclick="deleteMarking(${m.id})">🗑</button>
-        </div>
-      </div>`;
+  async flushQueue() {
+    if (replaying) return;
+    replaying = true;
+    try {
+      const queue = Storage.get(QUEUE_KEY, []);
+      const remaining = [];
+      for (const event of queue) {
+        try {
+          if (!this.isDuplicate(event.client_event_id)) this.remember(event.client_event_id);
+          await FirebaseService.set(FirebaseService.paths.event(event.session_id, event.event_id), {
+            ...event,
+            timestamp_server: FirebaseService.serverTimestamp(),
+            replayed_local: now()
+          });
+        } catch {
+          remaining.push(event);
+        }
+      }
+      Storage.set(QUEUE_KEY, remaining);
+    } finally {
+      replaying = false;
+    }
   },
 
-  // ── Stats ─────────────────────────────────────────────────────────────────────
-
-  renderStats() {
-    const statsEl = document.getElementById('stats');
-    if (!statsEl) return;
-
-    const block    = SessionManager.getCurrentBlock();
-    const markings = block?.markings ?? [];
-    const points   = markings.filter(m => m.type === 'point').length;
-    const ranges   = markings.filter(m => m.type === 'range').length;
-
-    statsEl.innerHTML = `
-      <div class="stat-item"><span class="stat-label">Total</span><span class="stat-value">${markings.length}</span></div>
-      <div class="stat-item"><span class="stat-label">Point</span><span class="stat-value">${points}</span></div>
-      <div class="stat-item"><span class="stat-label">Range</span><span class="stat-value">${ranges}</span></div>
-    `;
+  isDuplicate(clientEventId) {
+    return Storage.get(DEDUPE_KEY, []).includes(clientEventId);
   },
 
-  // ── Visual feedback ───────────────────────────────────────────────────────────
-
-  flashDisplay() {
-    flashElement('tc-display',        'var(--green)', 150);
-    flashElement('mobile-tc-display', 'var(--green)', 150);
-  },
-
-  // ── Helpers ───────────────────────────────────────────────────────────────────
-
-  _getSelectedColor() {
-    return document.querySelector('#color-picker .selected')?.dataset.color || '#4f8ef7';
-  },
-
-  _getNotes() {
-    return document.getElementById('mark-notes')?.value.trim() || '';
-  },
-
-  _esc(str) {
-    return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  remember(clientEventId) {
+    const recent = Storage.get(DEDUPE_KEY, []).filter(Boolean);
+    recent.push(clientEventId);
+    Storage.set(DEDUPE_KEY, recent.slice(-MAX_DEDUPE));
   }
 };
+
+function bridge() {
+  return window.MarkProBridge || {};
+}
 
 export default EventManager;

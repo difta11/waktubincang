@@ -1,140 +1,118 @@
-/**
- * app.js
- * Main entry point — bootstraps all modules in dependency order.
- *
- * Replace the inline <script type="module"> block at the bottom of index.html
- * with a single import:
- *
- *   <script type="module" src="js/app.js"></script>
- *
- * Keep the existing non-module <script> blocks that contain the timecode engine
- * and UI helpers (togglePlay, resetTC, renderBlocks, etc.) — app.js only
- * adds the Firebase integration layer without touching them.
- */
-
 import FirebaseService from './firebase-service.js';
-import DeviceManager   from './device-manager.js';
-import SessionManager  from '../session-manager.js';
-import EventManager    from './event-manager.js';
-import RealtimeSync    from '../realtime-sync.js';
-import { initToast, showToast } from '../utils.js';
-
-// ─── Boot sequence ────────────────────────────────────────────────────────────
+import DeviceManager from './device-manager.js';
+import SessionManager from './session-manager.js';
+import EventManager from './event-manager.js';
+import RealtimeSync from './realtime-sync.js';
+import { initToast, showToast } from './utils.js';
 
 async function boot() {
-  // 1. Toast (UI element, no deps)
   initToast();
-  window.showToast = showToast;
-
-  // 2. Firebase (must be first — other modules need window.db etc.)
-  const db = FirebaseService.init();
-
-  // 3. Device identity & presence
+  FirebaseService.init();
   DeviceManager.init();
-
-  // 4. Realtime sync — exposes attach/detach globals
   RealtimeSync.init();
-
-  // 5. Session / block management — exposes renderBlocks, openBlock etc.
-  SessionManager.init();
-
-  // 6. Event / marking management — exposes addPoint, toggleRange etc.
   EventManager.init();
 
-  // ── Fire post-init callbacks expected by existing inline code ──────────────
-  if (typeof window.updateIdentityUI   === 'function') window.updateIdentityUI();
-  if (typeof window.broadcastPresence  === 'function') window.broadcastPresence();
+  window.MarkProRealtime = {
+    mirrorBlock: (block) => SessionManager.mirrorBlock(block),
+    deleteSession: (id) => SessionManager.deleteSession(id),
+    joinSession: (id, block) => SessionManager.joinSession(id, block),
+    leaveSession: (id) => SessionManager.leaveSession(id),
+    recordMarker: (mark) => EventManager.recordMarker(mark),
+    deleteEvent: (markId) => EventManager.deleteEvent(markId),
+    updateEvent: (mark) => EventManager.updateEvent(mark),
+    syncTimecode: (state) => syncCanonicalTimecode(state),
+    syncSettings: (settings) => syncCanonicalSettings(settings),
+    setLiveStatus: (isLive) => SessionManager.setLiveStatus(isLive),
+    flushQueue: () => EventManager.flushQueue()
+  };
 
-  // ── Process any pending listeners (block opened before Firebase was ready) ─
+  await DeviceManager.registerGlobalPresence().catch(() => {});
+  SessionManager.init();
+  installKeyboardShortcuts();
+  installConnectionRecovery();
+  replayPendingIfOnline();
+
   if (window._pendingTimecodeBlock) {
-    RealtimeSync.attachTimecodeListener(window._pendingTimecodeBlock);
+    window.attachTimecodeListener(window._pendingTimecodeBlock);
     window._pendingTimecodeBlock = null;
   }
   if (window._pendingMarkersBlock) {
-    RealtimeSync.attachMarkersListener(window._pendingMarkersBlock);
+    window.attachMarkersListener(window._pendingMarkersBlock);
     window._pendingMarkersBlock = null;
   }
 
-  // ── Global online-users count listener ─────────────────────────────────────
-  FirebaseService.listen('session1/users', (data) => {
-    const count = data ? Object.keys(data).length : 0;
-    const el    = document.getElementById('online-count');
-    if (el) el.innerText = `${count} online`;
-  });
-
-  // ── Restore last session (if user refreshed while inside a block) ──────────
-  SessionManager.tryRestoreSession();
-
-  // ── Keyboard shortcuts ──────────────────────────────────────────────────────
-  _initKeyboardShortcuts();
-
-  // ── Connection status indicator ─────────────────────────────────────────────
-  _initConnectionStatus();
-
-  console.log('[App] Boot complete ✓  device:', DeviceManager.deviceId);
+  showToast('Realtime Firebase siap');
 }
 
-// ─── Keyboard shortcuts ───────────────────────────────────────────────────────
+async function syncCanonicalTimecode(state) {
+  const sessionId = bridge().currentBlockId;
+  if (!sessionId) return;
+  await FirebaseService.set(FirebaseService.paths.timecode(sessionId), {
+    ...state,
+    device_id: DeviceManager.deviceId,
+    device_name: DeviceManager.deviceName,
+    operator_name: DeviceManager.operatorName,
+    timestamp_server: FirebaseService.serverTimestamp()
+  }).catch(() => {});
+}
 
-function _initKeyboardShortcuts() {
-  document.addEventListener('keydown', (e) => {
-    // Don't fire when typing in an input/textarea
+async function syncCanonicalSettings(settings) {
+  const sessionId = bridge().currentBlockId;
+  if (!sessionId) return;
+  await FirebaseService.set(FirebaseService.paths.settings(sessionId), {
+    ...settings,
+    device_id: DeviceManager.deviceId,
+    operator_name: DeviceManager.operatorName,
+    timestamp_server: FirebaseService.serverTimestamp()
+  }).catch(() => {});
+}
+
+function installKeyboardShortcuts() {
+  document.addEventListener('keydown', (event) => {
     const tag = document.activeElement?.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (!bridge().currentBlockId) return;
 
-    // Close open modals on Escape
-    if (e.key === 'Escape') {
-      document.querySelectorAll('.modal-bg.open').forEach(m => m.classList.remove('open'));
-      return;
-    }
-
-    // Only active inside a block
-    if (!SessionManager.currentBlockId) return;
-
-    switch (e.key) {
-      case ' ':
-      case 'p':
-        e.preventDefault();
-        if (typeof window.togglePlay === 'function' && window.isHost) window.togglePlay();
-        break;
-      case 'm':
-      case 'M':
-        e.preventDefault();
-        EventManager.addPoint();
-        break;
-      case 'r':
-      case 'R':
-        e.preventDefault();
-        EventManager.toggleRange();
-        break;
-      case '0':
-        e.preventDefault();
-        if (typeof window.resetTC === 'function' && window.isHost) window.resetTC();
-        break;
+    if (event.key === 'm' || event.key === 'M') {
+      event.preventDefault();
+      window.addPoint?.();
+    } else if (event.key === 'r' || event.key === 'R') {
+      event.preventDefault();
+      window.toggleRange?.();
+    } else if (event.key === ' ' || event.key === 'p' || event.key === 'P') {
+      event.preventDefault();
+      if (bridge().isHost) window.togglePlay?.();
+    } else if (event.key === '0') {
+      event.preventDefault();
+      if (bridge().isHost) window.resetTC?.();
     }
   });
 }
 
-// ─── Connection status ────────────────────────────────────────────────────────
-// Colours the user-dot green/amber based on navigator.onLine
+function installConnectionRecovery() {
+  window.addEventListener('online', () => {
+    DeviceManager.heartbeat().catch(() => {});
+    EventManager.flushQueue();
+    showToast('Koneksi pulih, sinkronisasi dilanjutkan');
+  });
 
-function _initConnectionStatus() {
-  const dots = document.querySelectorAll('.user-dot, #identity-dot');
+  window.addEventListener('offline', () => {
+    showToast('Offline: event akan diantrikan');
+  });
 
-  function updateDots(online) {
-    dots.forEach(d => {
-      d.style.background = online ? 'var(--green)' : 'var(--amber)';
-    });
-    if (!online) showToast('⚠️ Koneksi terputus — mencoba reconnect…');
-    else         showToast('✅ Terhubung kembali');
-  }
-
-  window.addEventListener('online',  () => updateDots(true));
-  window.addEventListener('offline', () => updateDots(false));
+  setInterval(() => DeviceManager.heartbeat().catch(() => {}), 5000);
 }
 
-// ─── Kick off ─────────────────────────────────────────────────────────────────
-boot().catch(err => {
-  console.error('[App] Boot failed:', err);
-  showToast('❌ Gagal menghubungkan ke Firebase');
+function replayPendingIfOnline() {
+  if (navigator.onLine) EventManager.flushQueue();
+}
+
+function bridge() {
+  return window.MarkProBridge || {};
+}
+
+boot().catch((error) => {
+  console.error('[app] boot failed', error);
+  initToast();
+  showToast('Gagal inisialisasi realtime Firebase');
 });

@@ -1,244 +1,243 @@
-/**
- * realtime-sync.js
- * Per-block realtime Firebase listeners.
- *
- * Manages three listener categories:
- *   1. Timecode state  → session1/timecodes/{blockId}
- *   2. Settings (fps/format) → session1/settings/{blockId}
- *   3. Markings → session1/blocks/{blockId}/markings
- *
- * All listeners are attached when a block is opened and detached on close.
- * This module is purely reactive — it only reads from Firebase and updates
- * local state / UI.  Writes are done by EventManager / timecode engine.
- */
+import FirebaseService from './firebase-service.js';
+import DeviceManager from './device-manager.js';
+import { toArrayFromObject } from './utils.js';
 
-import FirebaseService from './js/firebase-service.js';
-import SessionManager  from './session-manager.js';
-import DeviceManager   from './device-manager.js';
-import { showToast }   from './utils.js';
+let timecodeUnsub = null;
+let legacyTimecodeUnsub = null;
+let settingsUnsub = null;
+let legacySettingsUnsub = null;
+let markersUnsub = null;
+let eventsAddedUnsub = null;
+let eventsChangedUnsub = null;
+let devicesUnsub = null;
+const seenEventsBySession = new Map();
 
-// ─── Unsubscribe handles ──────────────────────────────────────────────────────
-let _tcUnsub       = null;
-let _settingsUnsub = null;
-let _markersUnsub  = null;
-
-// ─── Public API ───────────────────────────────────────────────────────────────
 const RealtimeSync = {
-
   init() {
-    // Expose attach/detach functions to global scope for index.html inline code
-    window.attachTimecodeListener  = (id) => RealtimeSync.attachTimecodeListener(id);
-    window.detachTimecodeListener  = ()   => RealtimeSync.detachTimecodeListener();
-    window.attachSettingsListener  = (id) => RealtimeSync.attachSettingsListener(id);
-    window.detachSettingsListener  = ()   => RealtimeSync.detachSettingsListener();
-    window.attachMarkersListener   = (id) => RealtimeSync.attachMarkersListener(id);
-    window.detachMarkersListener   = ()   => RealtimeSync.detachMarkersListener();
+    window.attachTimecodeListener = (id) => this.attachTimecodeListener(id);
+    window.detachTimecodeListener = () => this.detachTimecodeListener();
+    window.attachSettingsListener = (id) => this.attachSettingsListener(id);
+    window.detachSettingsListener = () => this.detachSettingsListener();
+    window.attachMarkersListener = (id) => this.attachMarkersListener(id);
+    window.detachMarkersListener = () => this.detachMarkersListener();
   },
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 1. TIMECODE LISTENER
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  attachTimecodeListener(blockId) {
-    if (_tcUnsub) { _tcUnsub(); _tcUnsub = null; }
-    let firstCall = true;
-
-    _tcUnsub = FirebaseService.listen(`session1/timecodes/${blockId}`, (data) => {
-      // Guard: ignore if we navigated away
-      if (SessionManager.currentBlockId !== blockId) return;
-
-      // Update LIVE badge
-      const block = SessionManager.getCurrentBlock();
-      if (block) {
-        const wasLive  = !!block.liveUser;
-        block.liveUser = data?.running ? (data.host || null) : null;
-        if (wasLive !== !!block.liveUser && typeof window.renderBlocks === 'function') {
-          window.renderBlocks();
-        }
-      }
-      if (data && typeof window._updateLiveBadgeInSession === 'function') {
-        window._updateLiveBadgeInSession(!!data.running);
-      }
-
-      if (!data) { firstCall = false; return; }
-
-      const fps = window.fps || 25;
-
-      if (window.isHost) {
-        if (firstCall) {
-          firstCall = false;
-          this._applyTCToHost(data, fps);
-        } else {
-          // Follow Firebase only if change came from another device
-          if (data.host && data.host !== DeviceManager.username) {
-            this._applyTCToHost(data, fps);
-          }
-        }
-        return;
-      }
-
-      // ── GUEST: always follow Firebase ───────────────────────────────────────
-      firstCall = false;
-      this._applyTCToGuest(data, fps);
+  attachTimecodeListener(sessionId) {
+    this.detachTimecodeListener();
+    timecodeUnsub = FirebaseService.listen(FirebaseService.paths.timecode(sessionId), (data) => {
+      applyTimecode(sessionId, data);
     });
-  },
-
-  _applyTCToHost(data, fps) {
-    if (data.running && !window.running) {
-      const elapsed = (Date.now() - data.startTime) / 1000;
-      window.frame  = Math.max(0, Math.floor(elapsed * fps) + (data.frameOffset || 0));
-      window.running = true;
-      cancelAnimationFrame(window.raf);
-      window.lastTime = null;
-      window.raf = requestAnimationFrame(window.loop);
-      if (typeof window._setPlayUI === 'function') window._setPlayUI(true);
-      if (typeof window._updateLiveBadgeInSession === 'function') window._updateLiveBadgeInSession(true);
-      if (typeof window.updateDisplay === 'function') window.updateDisplay();
-    } else if (!data.running && window.running) {
-      window.running = false;
-      cancelAnimationFrame(window.raf); window.raf = null;
-      if (data.reset) {
-        window.frame = 0;
-        if (typeof window._applyResetUI === 'function') window._applyResetUI();
-      } else if (data.frameAtStop !== undefined) {
-        window.frame = data.frameAtStop;
-      }
-      if (typeof window._setPlayUI === 'function') window._setPlayUI(false);
-      if (typeof window._updateLiveBadgeInSession === 'function') window._updateLiveBadgeInSession(false);
-      if (typeof window.updateDisplay === 'function') window.updateDisplay();
-    }
-  },
-
-  _applyTCToGuest(data, fps) {
-    if (data.running) {
-      const elapsed  = (Date.now() - data.startTime) / 1000;
-      const newFrame = Math.floor(elapsed * fps) + (data.frameOffset || 0);
-      window.frame   = Math.max(0, newFrame);
-      if (!window.running) {
-        window.running = true;
-        cancelAnimationFrame(window.raf);
-        window.lastTime = null;
-        window.raf = requestAnimationFrame(window.loop);
-        if (typeof window._setPlayUI === 'function') window._setPlayUI(true);
-      }
-      if (typeof window.updateDisplay === 'function') window.updateDisplay();
-    } else {
-      window.running = false;
-      cancelAnimationFrame(window.raf); window.raf = null;
-      if (data.reset) {
-        window.frame = 0;
-        // Reset range UI
-        const ri  = document.getElementById('range-indicator');
-        if (ri)   ri.classList.remove('active');
-        const btn = document.getElementById('btn-range-toggle');
-        if (btn)  { btn.textContent = '▷ Start Range'; btn.classList.remove('warning'); }
-        const mri = document.getElementById('m-range-icon');
-        if (mri)  mri.textContent = '▷';
-        const mrl = document.getElementById('m-range-label');
-        if (mrl)  mrl.textContent = 'Start Range';
-        const mrb = document.getElementById('m-btn-range');
-        if (mrb)  mrb.classList.remove('recording');
-      } else if (data.frameAtStop !== undefined) {
-        window.frame = data.frameAtStop;
-      }
-      if (typeof window._setPlayUI === 'function') window._setPlayUI(false);
-      if (typeof window._updateLiveBadgeInSession === 'function') window._updateLiveBadgeInSession(false);
-      if (typeof window.updateDisplay === 'function') window.updateDisplay();
-    }
+    legacyTimecodeUnsub = FirebaseService.listen(`${FirebaseService.paths.legacyTimecodes}/${sessionId}`, (data) => {
+      if (data) applyTimecode(sessionId, data);
+    });
   },
 
   detachTimecodeListener() {
-    if (_tcUnsub) { _tcUnsub(); _tcUnsub = null; }
+    if (timecodeUnsub) timecodeUnsub();
+    if (legacyTimecodeUnsub) legacyTimecodeUnsub();
+    timecodeUnsub = null;
+    legacyTimecodeUnsub = null;
   },
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 2. SETTINGS LISTENER  (fps + format)
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  attachSettingsListener(blockId) {
-    if (_settingsUnsub) { _settingsUnsub(); _settingsUnsub = null; }
-
-    _settingsUnsub = FirebaseService.listen(`session1/settings/${blockId}`, (data) => {
-      if (!data || window.isHost || SessionManager.currentBlockId !== blockId) return;
-
-      const validFmts = ['hh:mm:ss:ff','mm:ss:ff','mm:ss','ss:ff'];
-      const fpsSel    = document.getElementById('fps-sel');
-      const mFpsSel   = document.getElementById('m-fps-sel');
-      const fmtSel    = document.getElementById('fmt-sel');
-      const mFmtSel   = document.getElementById('m-fmt-sel');
-      const customFmt = document.getElementById('custom-fmt');
-
-      if (data.fps && data.fps !== window.fps) {
-        window.fps = data.fps;
-        if (fpsSel)  fpsSel.value  = data.fps;
-        if (mFpsSel) mFpsSel.value = data.fps;
-      }
-
-      if (data.fmt) {
-        if (validFmts.includes(data.fmt)) {
-          if (fmtSel)  fmtSel.value  = data.fmt;
-          if (mFmtSel) mFmtSel.value = data.fmt;
-          if (customFmt) customFmt.style.display = 'none';
-        } else {
-          if (fmtSel)  fmtSel.value  = 'custom';
-          if (customFmt) {
-            customFmt.value        = data.fmt;
-            customFmt.style.display = '';
-          }
-          if (mFmtSel) mFmtSel.value = 'hh:mm:ss:ff';
-        }
-      }
-
-      if (typeof window.updateDisplay === 'function') window.updateDisplay();
-      if (typeof window.renderList    === 'function') window.renderList();
-    });
+  attachSettingsListener(sessionId) {
+    this.detachSettingsListener();
+    settingsUnsub = FirebaseService.listen(FirebaseService.paths.settings(sessionId), (data) => applySettings(sessionId, data));
+    legacySettingsUnsub = FirebaseService.listen(`${FirebaseService.paths.legacySettings}/${sessionId}`, (data) => applySettings(sessionId, data));
   },
 
   detachSettingsListener() {
-    if (_settingsUnsub) { _settingsUnsub(); _settingsUnsub = null; }
+    if (settingsUnsub) settingsUnsub();
+    if (legacySettingsUnsub) legacySettingsUnsub();
+    settingsUnsub = null;
+    legacySettingsUnsub = null;
   },
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 3. MARKERS LISTENER
-  // ═══════════════════════════════════════════════════════════════════════════
+  attachMarkersListener(sessionId) {
+    this.detachMarkersListener();
+    seenEventsBySession.set(sessionId, new Set());
 
-  attachMarkersListener(blockId) {
-    if (_markersUnsub) { _markersUnsub(); _markersUnsub = null; }
+    markersUnsub = FirebaseService.listen(`${FirebaseService.paths.legacyBlocks}/${sessionId}/markings`, (data) => {
+      syncLegacyMarkersToUi(sessionId, data);
+    });
 
-    _markersUnsub = FirebaseService.listen(
-      `session1/blocks/${blockId}/markings`,
-      (data) => {
-        if (SessionManager.currentBlockId !== blockId) return;
-
-        const block = SessionManager.getCurrentBlock();
-        if (!block) return;
-
-        const newMarkings = data && typeof data === 'object'
-          ? Object.entries(data).map(([fbKey, m]) => ({ ...m, _fbKey: fbKey }))
-          : [];
-
-        block.markings  = newMarkings;
-        window.markings = newMarkings;
-
-        if (typeof window.renderList  === 'function') window.renderList();
-        if (typeof window.renderStats === 'function') window.renderStats();
-
-        // Toast: notify about markers added by other users
-        const prevCount = window._lastMarkerCount ?? 0;
-        if (newMarkings.length > prevCount) {
-          const newest = newMarkings[newMarkings.length - 1];
-          if (newest?.user && newest.user !== DeviceManager.username) {
-            showToast('📌 ' + newest.user + ' menambah marking');
-          }
-        }
-        window._lastMarkerCount = newMarkings.length;
+    eventsAddedUnsub = FirebaseService.listenChildAdded(
+      FirebaseService.paths.events(sessionId),
+      { orderBy: 'created_order', limitLast: 300 },
+      (event, key) => {
+        if (!event || event.deleted) return;
+        rememberEvent(sessionId, key);
+        appendEventToUi(sessionId, event, key);
       }
     );
+
+    eventsChangedUnsub = FirebaseService.listenChildChanged(
+      FirebaseService.paths.events(sessionId),
+      { orderBy: 'created_order', limitLast: 300 },
+      (event, key) => {
+        if (!event) return;
+        patchEventInUi(sessionId, event, key);
+      }
+    );
+
+    devicesUnsub = FirebaseService.listen(FirebaseService.paths.devices(sessionId), (data) => {
+      const block = bridge().block;
+      if (!block || bridge().currentBlockId !== sessionId) return;
+      const devices = toArrayFromObject(data).filter((device) => device.status !== 'offline');
+      block.participants = devices.map((device) => ({
+        name: device.operator_name || device.name || 'Unknown',
+        color: device.color || '#4f8ef7',
+        device_id: device.device_id,
+        device_name: device.device_name
+      }));
+      const onlineUsers = devices.reduce((acc, device) => {
+        acc[device.device_id] = device;
+        return acc;
+      }, {});
+      if (typeof bridge().setOnlineUsers === 'function') bridge().setOnlineUsers(onlineUsers);
+      if (typeof bridge().renderUserList === 'function') bridge().renderUserList();
+      if (typeof bridge().renderStats === 'function') bridge().renderStats();
+    });
   },
 
   detachMarkersListener() {
-    if (_markersUnsub) { _markersUnsub(); _markersUnsub = null; }
+    if (markersUnsub) markersUnsub();
+    if (eventsAddedUnsub) eventsAddedUnsub();
+    if (eventsChangedUnsub) eventsChangedUnsub();
+    if (devicesUnsub) devicesUnsub();
+    markersUnsub = null;
+    eventsAddedUnsub = null;
+    eventsChangedUnsub = null;
+    devicesUnsub = null;
   }
 };
+
+function applyTimecode(sessionId, data) {
+  const b = bridge();
+  if (!data || b.currentBlockId !== sessionId) return;
+  const fromSelf = data.device_id && data.device_id === DeviceManager.deviceId;
+  if (b.isHost && fromSelf) return;
+
+  const fps = b.fps || 25;
+  if (data.running) {
+    const startTime = data.startTime || data.start_time_local || Date.now();
+    const elapsed = (Date.now() - startTime) / 1000;
+    b.frame = Math.max(0, Math.floor(elapsed * fps) + (data.frameOffset || data.frame_offset || 0));
+    b.running = true;
+    if (typeof b.startLoop === 'function') b.startLoop();
+    if (typeof b.setPlayUI === 'function') b.setPlayUI(true);
+    if (typeof b.updateLiveBadge === 'function') b.updateLiveBadge(true);
+  } else {
+    b.running = false;
+    if (typeof b.stopLoop === 'function') b.stopLoop();
+    if (data.reset && typeof b.applyResetUI === 'function') b.applyResetUI();
+    b.frame = data.frameAtStop ?? data.frame_at_stop ?? b.frame ?? 0;
+    if (typeof b.setPlayUI === 'function') b.setPlayUI(false);
+    if (typeof b.updateLiveBadge === 'function') b.updateLiveBadge(false);
+  }
+  if (typeof b.updateDisplay === 'function') b.updateDisplay();
+}
+
+function applySettings(sessionId, data) {
+  const b = bridge();
+  if (!data || b.currentBlockId !== sessionId || b.isHost) return;
+  if (data.fps) {
+    b.fps = Number(data.fps);
+    const fpsSel = document.getElementById('fps-sel');
+    const mFpsSel = document.getElementById('m-fps-sel');
+    if (fpsSel) fpsSel.value = String(data.fps);
+    if (mFpsSel) mFpsSel.value = String(data.fps);
+  }
+  const fmt = data.fmt || data.format;
+  if (fmt) {
+    const fmtSel = document.getElementById('fmt-sel');
+    const mFmtSel = document.getElementById('m-fmt-sel');
+    const custom = document.getElementById('custom-fmt');
+    const known = ['hh:mm:ss:ff', 'mm:ss:ff', 'mm:ss', 'ss:ff'];
+    if (known.includes(fmt)) {
+      if (fmtSel) fmtSel.value = fmt;
+      if (mFmtSel) mFmtSel.value = fmt;
+      if (custom) custom.style.display = 'none';
+    } else {
+      if (fmtSel) fmtSel.value = 'custom';
+      if (custom) {
+        custom.value = fmt;
+        custom.style.display = '';
+      }
+    }
+  }
+  if (typeof b.updateDisplay === 'function') b.updateDisplay();
+  if (typeof b.renderList === 'function') b.renderList();
+}
+
+function syncLegacyMarkersToUi(sessionId, data) {
+  const b = bridge();
+  if (b.currentBlockId !== sessionId) return;
+  const block = b.block;
+  if (!block) return;
+  block.markings = toArrayFromObject(data, (fbKey, mark) => ({ ...mark, _fbKey: fbKey }));
+  window.markings = block.markings;
+  if (typeof b.saveBlocks === 'function') b.saveBlocks();
+  if (typeof b.renderList === 'function') b.renderList();
+  if (typeof b.renderStats === 'function') b.renderStats();
+}
+
+function appendEventToUi(sessionId, event, key) {
+  const b = bridge();
+  if (b.currentBlockId !== sessionId) return;
+  const block = b.block;
+  if (!block) return;
+  if (event.device_id === DeviceManager.deviceId) return;
+  const exists = (block.markings || []).some((mark) => mark.event_id === key || mark.client_event_id === event.client_event_id);
+  if (exists) return;
+  block.markings = [...(block.markings || []), eventToMark(event, key)];
+  window.markings = block.markings;
+  if (typeof b.renderList === 'function') b.renderList();
+  if (typeof b.renderStats === 'function') b.renderStats();
+}
+
+function patchEventInUi(sessionId, event, key) {
+  const b = bridge();
+  if (b.currentBlockId !== sessionId) return;
+  const block = b.block;
+  if (!block) return;
+  if (event.deleted) {
+    block.markings = (block.markings || []).filter((mark) => mark.event_id !== key);
+  } else {
+    const index = (block.markings || []).findIndex((mark) => mark.event_id === key);
+    if (index >= 0) block.markings[index] = { ...block.markings[index], ...eventToMark(event, key) };
+  }
+  window.markings = block.markings || [];
+  if (typeof b.renderList === 'function') b.renderList();
+  if (typeof b.renderStats === 'function') b.renderStats();
+}
+
+function eventToMark(event, key) {
+  const isRange = event.event_type === 'RANGE' || event.type === 'range';
+  return {
+    id: event.legacy_mark_id || key,
+    event_id: key,
+    _eventKey: key,
+    client_event_id: event.client_event_id,
+    type: isRange ? 'range' : 'point',
+    startTC: event.startTC || event.timecode || '00:00:00:00',
+    startFrame: event.frame || 0,
+    endTC: event.endTC || event.startTC || event.timecode || '00:00:00:00',
+    endFrame: event.end_frame ?? event.frame ?? 0,
+    color: event.color || '#4f8ef7',
+    notes: event.note || '',
+    user: event.operator_name || event.user || 'Unknown',
+    ts: event.local_timestamp || event.created_order || Date.now()
+  };
+}
+
+function rememberEvent(sessionId, key) {
+  const seen = seenEventsBySession.get(sessionId) || new Set();
+  seen.add(key);
+  seenEventsBySession.set(sessionId, seen);
+}
+
+function bridge() {
+  return window.MarkProBridge || {};
+}
 
 export default RealtimeSync;

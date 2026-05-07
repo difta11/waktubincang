@@ -1034,6 +1034,7 @@ function createBlock(){
   if(window.firebaseReady){
     try{
       fb_set(fb_ref(db,'session1/blocks/'+block.id),block);
+      if(window.MarkProRealtime)window.MarkProRealtime.mirrorBlock(block);
     }catch(e){
       blocks.push({...block,markings:[],participants:[]});
       saveBlocks();renderBlocks();
@@ -1049,6 +1050,7 @@ function deleteBlock(id){
   const b=blocks.find(x=>x.id===id);
   if(b&&b.liveUser){alert('Tidak bisa hapus block yang sedang Live.');return;}
   if(!confirm('Hapus block ini beserta semua markingnya?'))return;
+  if(window.MarkProRealtime)window.MarkProRealtime.deleteSession(id);
   if(window.firebaseReady){
     try{fb_set(fb_ref(db,'session1/blocks/'+id),null);}
     catch(e){blocks=blocks.filter(b=>b.id!==id);saveBlocks();renderBlocks();}
@@ -1064,6 +1066,7 @@ function openBlock(id){
   currentBlockId=id;
   isHost=(block.host===username);
   markings=block.markings||[];
+  if(window.MarkProRealtime)window.MarkProRealtime.joinSession(id,block);
 
   // Daftar sebagai participant
   const safeKey=username.replace(/[.#$\/\[\]]/g,'_');
@@ -1125,6 +1128,7 @@ function openBlock(id){
 
 function backToBlocks(){
   if(running){running=false;cancelAnimationFrame(raf);raf=null;}
+  const leavingBlockId=currentBlockId;
   if(window.detachTimecodeListener)window.detachTimecodeListener();
   if(window.detachSettingsListener)window.detachSettingsListener();
   if(window.detachMarkersListener)window.detachMarkersListener();
@@ -1134,6 +1138,7 @@ function backToBlocks(){
     try{fb_set(fb_ref(db,'session1/blocks/'+currentBlockId+'/liveUser'),null);}catch(e){}
   }
   currentBlockId=null;
+  if(window.MarkProRealtime&&leavingBlockId)window.MarkProRealtime.leaveSession(leavingBlockId);
   try{localStorage.removeItem('markpro_currentBlock');}catch(e){}
   document.getElementById('screen-session').style.display='none';
   document.getElementById('screen-blocks').style.display='flex';
@@ -1220,6 +1225,13 @@ function loop(ts){
 // ════════════════════════════════════════
 function syncStartTimecode(){
   if(!currentBlockId||!window.firebaseReady)return;
+  if(window.MarkProRealtime)window.MarkProRealtime.syncTimecode({
+    startTime:Date.now(),
+    frameOffset:frame,
+    running:true,
+    host:username,
+    ts:Date.now()
+  });
   try{
     fb_set(fb_ref(db,'session1/timecodes/'+currentBlockId),{
       startTime:Date.now(),
@@ -1233,6 +1245,12 @@ function syncStartTimecode(){
 
 function syncStopTimecode(){
   if(!currentBlockId||!window.firebaseReady)return;
+  if(window.MarkProRealtime)window.MarkProRealtime.syncTimecode({
+    running:false,
+    frameAtStop:frame,
+    host:username,
+    ts:Date.now()
+  });
   try{
     fb_set(fb_ref(db,'session1/timecodes/'+currentBlockId),{
       running:false,
@@ -1272,6 +1290,7 @@ function resetTC(){
   frame=0;rangeStart=null;rangeStartFrame=null;
   if(currentBlockId&&window.firebaseReady){
     try{
+      if(window.MarkProRealtime)window.MarkProRealtime.syncTimecode({running:false,frameAtStop:0,reset:true,host:username,ts:Date.now()});
       fb_set(fb_ref(db,'session1/timecodes/'+currentBlockId),{running:false,frameAtStop:0,reset:true,ts:Date.now()});
       fb_set(fb_ref(db,'session1/blocks/'+currentBlockId+'/liveUser'),null);
     }catch(e){}
@@ -1345,6 +1364,7 @@ function syncSettings(){
     ?(document.getElementById('custom-fmt').value||'hh:mm:ss:ff')
     :document.getElementById('fmt-sel').value;
   try{fb_set(fb_ref(db,'session1/settings/'+currentBlockId),{fps,fmt,ts:Date.now()});}catch(e){}
+  if(window.MarkProRealtime)window.MarkProRealtime.syncSettings({fps,fmt,ts:Date.now()});
 }
 
 // ════════════════════════════════════════
@@ -1355,6 +1375,7 @@ function getNotes(){return document.getElementById('mark-notes').value.trim();}
 
 function syncMarker(mark){
   if(!currentBlockId||!window.firebaseReady)return;
+  if(window.MarkProRealtime)window.MarkProRealtime.recordMarker(mark);
   try{
     const markRef=fb_ref(db,'session1/blocks/'+currentBlockId+'/markings');
     const newRef=fb_push(markRef);
@@ -1365,6 +1386,7 @@ function syncMarker(mark){
 
 function syncDeleteMarker(markId){
   if(!currentBlockId||!window.firebaseReady)return;
+  if(window.MarkProRealtime)window.MarkProRealtime.deleteEvent(markId);
   try{
     const block=getCurrentBlock();if(!block)return;
     const mark=block.markings.find(m=>String(m.id)===String(markId));
@@ -1376,6 +1398,7 @@ function syncDeleteMarker(markId){
 
 function syncEditMarker(mark){
   if(!currentBlockId||!window.firebaseReady)return;
+  if(window.MarkProRealtime)window.MarkProRealtime.updateEvent(mark);
   try{
     if(mark._fbKey){
       fb_set(fb_ref(db,'session1/blocks/'+currentBlockId+'/markings/'+mark._fbKey),mark);
@@ -1385,6 +1408,7 @@ function syncEditMarker(mark){
 
 function syncLiveStatus(isLive){
   if(!currentBlockId||!window.firebaseReady)return;
+  if(window.MarkProRealtime)window.MarkProRealtime.setLiveStatus(isLive);
   try{fb_set(fb_ref(db,'session1/blocks/'+currentBlockId+'/liveUser'),isLive?username:null);}catch(e){}
 }
 
@@ -1715,6 +1739,46 @@ document.getElementById('welcome-name-input').addEventListener('keydown',functio
   const inp=document.getElementById('welcome-name-input');
   if(inp)inp.focus();
 })();
+
+// Minimal bridge for ES modules. Keeps the existing UI code in charge while
+// allowing the realtime backend layer to read current state safely.
+window.MarkProBridge={
+  get frame(){return frame;},
+  set frame(v){frame=v;},
+  get running(){return running;},
+  set running(v){running=v;},
+  get fps(){return fps;},
+  set fps(v){fps=v;},
+  get username(){return username;},
+  set username(v){username=v;},
+  get deviceName(){return navigator.userAgentData?.platform||navigator.platform||'Browser Device';},
+  get myAvatarColor(){return myAvatarColor;},
+  get currentBlockId(){return currentBlockId;},
+  get isHost(){return isHost;},
+  get blocks(){return blocks;},
+  get block(){return getCurrentBlock();},
+  get color(){return getSelectedColor();},
+  get notes(){return getNotes();},
+  frameToTC,
+  renderList,
+  renderStats,
+  renderUserList,
+  updateDisplay,
+  startLoop(){
+    cancelAnimationFrame(raf);
+    lastTime=null;
+    raf=requestAnimationFrame(loop);
+  },
+  stopLoop(){
+    cancelAnimationFrame(raf);
+    raf=null;
+  },
+  setPlayUI:_setPlayUI,
+  updateLiveBadge:_updateLiveBadgeInSession,
+  applyResetUI:_applyResetUI,
+  setOnlineUsers(v){onlineUsers=v||{};},
+  saveBlocks
+};
 </script>
 <!--
   ╔══════════════════════════════════════════════════════════════╗
